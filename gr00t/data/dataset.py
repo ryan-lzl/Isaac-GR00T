@@ -153,6 +153,7 @@ class LeRobotSingleDataset(Dataset):
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
         self._max_delta_index = self._get_max_delta_index()
+        self._episode_metadata = self._load_episode_metadata()
 
         # NOTE(YL): method to predict the task progress
         if "action.task_progress" in self._modality_keys["action"]:
@@ -409,6 +410,58 @@ class LeRobotSingleDataset(Dataset):
             trajectory_lengths.append(episode["length"])
         return np.array(trajectory_ids), np.array(trajectory_lengths)
 
+    def _load_episode_metadata(self) -> dict[int, dict]:
+        """Load per-episode file indices and timestamp offsets if available from meta/episodes parquet files."""
+        episodes_dir = self.dataset_path / "meta" / "episodes"
+        if not episodes_dir.exists():
+            return {}
+        parquet_files = sorted(episodes_dir.rglob("*.parquet"))
+        if len(parquet_files) == 0:
+            return {}
+
+        dfs: list[pd.DataFrame] = []
+        for p in parquet_files:
+            dfs.append(pd.read_parquet(p))
+        episode_df = pd.concat(dfs, ignore_index=True)
+        if "episode_index" not in episode_df.columns:
+            return {}
+
+        # Discover available video keys from the column names.
+        video_keys: set[str] = set()
+        for col in episode_df.columns:
+            if col.startswith("videos/") and col.endswith("/chunk_index"):
+                video_keys.add(col[len("videos/") : -len("/chunk_index")])
+
+        metadata: dict[int, dict] = {}
+        for _, row in episode_df.iterrows():
+            ep_idx = int(row["episode_index"])
+            meta: dict[str, dict | int | float] = {
+                "data_chunk_index": int(row.get("data/chunk_index", 0)),
+                "data_file_index": int(row.get("data/file_index", 0)),
+                "dataset_from_index": int(row.get("dataset_from_index", 0)),
+                "dataset_to_index": int(row.get("dataset_to_index", 0)),
+                "video": {},
+            }
+            for vk in video_keys:
+                chunk_key = f"videos/{vk}/chunk_index"
+                file_key = f"videos/{vk}/file_index"
+                from_key = f"videos/{vk}/from_timestamp"
+                to_key = f"videos/{vk}/to_timestamp"
+                if (
+                    chunk_key in row
+                    and file_key in row
+                    and from_key in row
+                    and to_key in row
+                ):
+                    meta["video"][vk] = {
+                        "chunk_index": int(row[chunk_key]),
+                        "file_index": int(row[file_key]),
+                        "from_timestamp": float(row[from_key]),
+                        "to_timestamp": float(row[to_key]),
+                    }
+            metadata[ep_idx] = meta
+        return metadata
+
     def _get_all_steps(self) -> list[tuple[int, int]]:
         """Get the trajectory IDs and base indices for all steps in the dataset.
 
@@ -580,12 +633,28 @@ class LeRobotSingleDataset(Dataset):
         if self.curr_traj_id == trajectory_id and self.curr_traj_data is not None:
             return self.curr_traj_data
         else:
-            chunk_index = self.get_episode_chunk(trajectory_id)
+            # Use per-episode metadata if available to locate the correct file and slice.
+            locator = self._episode_metadata.get(trajectory_id, {})
+            chunk_index = int(locator.get("data_chunk_index", self.get_episode_chunk(trajectory_id)))
+            file_index = int(locator.get("data_file_index", trajectory_id))
+            format_kwargs = {
+                "episode_chunk": chunk_index,
+                "episode_index": trajectory_id,
+                "chunk_index": chunk_index,
+                "file_index": file_index,
+            }
             parquet_path = self.dataset_path / self.data_path_pattern.format(
-                episode_chunk=chunk_index, episode_index=trajectory_id
+                **format_kwargs
             )
             assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-            return pd.read_parquet(parquet_path)
+            traj_df = pd.read_parquet(parquet_path)
+            start_idx = locator.get("dataset_from_index")
+            end_idx = locator.get("dataset_to_index")
+            if start_idx is not None and end_idx is not None:
+                traj_df = traj_df.iloc[int(start_idx) : int(end_idx)].reset_index(drop=True)
+            self.curr_traj_id = trajectory_id
+            self.curr_traj_data = traj_df
+            return traj_df
 
     def get_trajectory_index(self, trajectory_id: int) -> int:
         """Get the index of the trajectory in the dataset by the trajectory ID.
@@ -656,12 +725,23 @@ class LeRobotSingleDataset(Dataset):
         return output
 
     def get_video_path(self, trajectory_id: int, key: str) -> Path:
-        chunk_index = self.get_episode_chunk(trajectory_id)
+        locator = self._episode_metadata.get(trajectory_id, {})
         original_key = self.lerobot_modality_meta.video[key].original_key
         if original_key is None:
             original_key = key
+        video_locator = {}
+        if locator and "video" in locator and original_key in locator["video"]:
+            video_locator = locator["video"][original_key]
+        chunk_index = int(
+            video_locator.get("chunk_index", locator.get("data_chunk_index", self.get_episode_chunk(trajectory_id)))
+        )
+        file_index = int(video_locator.get("file_index", locator.get("data_file_index", trajectory_id)))
         video_filename = self.video_path_pattern.format(
-            episode_chunk=chunk_index, episode_index=trajectory_id, video_key=original_key
+            episode_chunk=chunk_index,
+            episode_index=trajectory_id,
+            chunk_index=chunk_index,
+            file_index=file_index,
+            video_key=original_key,
         )
         return self.dataset_path / video_filename
 
@@ -700,7 +780,15 @@ class LeRobotSingleDataset(Dataset):
         assert "timestamp" in self.curr_traj_data.columns, f"No timestamp found in {trajectory_id=}"
         timestamp: np.ndarray = self.curr_traj_data["timestamp"].to_numpy()
         # Get the corresponding video timestamps from the step indices
-        video_timestamp = timestamp[step_indices]
+        video_locator = {}
+        if trajectory_id in self._episode_metadata:
+            locator = self._episode_metadata[trajectory_id]
+            original_key = self.lerobot_modality_meta.video[key].original_key
+            if original_key is None:
+                original_key = key
+            video_locator = locator.get("video", {}).get(original_key, {})
+        offset = float(video_locator.get("from_timestamp", 0.0))
+        video_timestamp = timestamp[step_indices] + offset
 
         return get_frames_by_timestamps(
             video_path.as_posix(),

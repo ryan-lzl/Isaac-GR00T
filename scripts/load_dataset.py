@@ -88,15 +88,25 @@ def get_modality_keys(dataset_path: pathlib.Path) -> dict[str, list[str]]:
 def plot_state_action_space(
     state_dict: dict[str, np.ndarray],
     action_dict: dict[str, np.ndarray],
-    shared_keys: list[str] = ["left_arm", "right_arm", "left_hand", "right_hand"],
+    shared_keys: list[str] | None = None,
 ):
     """
     Plot the state and action space side by side.
 
     state_dict: dict[str, np.ndarray] with key: [Time, Dimension]
     action_dict: dict[str, np.ndarray] with key: [Time, Dimension]
-    shared_keys: list[str] of keys to plot (without the "state." or "action." prefix)
+    shared_keys: list[str] of keys to plot (without the "state." or "action." prefix).
+    If None, uses the intersection of state/action keys provided.
     """
+    if shared_keys is None:
+        state_keys = {k.split(".", 1)[1] for k in state_dict}
+        action_keys = {k.split(".", 1)[1] for k in action_dict}
+        shared_keys = sorted(state_keys & action_keys)
+
+    if len(shared_keys) == 0:
+        print("Warning: No shared state/action keys to plot; skipping state/action figure.")
+        return
+
     # Create a figure with one subplot per shared key
     fig = plt.figure(figsize=(16, 4 * len(shared_keys)))
 
